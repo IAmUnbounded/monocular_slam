@@ -17,14 +17,14 @@ struct keyframes{
     Mat pose;
 };
 struct submap{
-    vector< vector<Point3d> > landmarks;
+    map<Mat,Point3d> landmarks;
+    vector<keyframes> keys;
     vector<keyframes> frames;
-    vector<int> keys;
 };
 static void computeFundamentalMatrix(const vector<KeyPoint> positions1,const vector<KeyPoint> positions2,
                                     vector<Point2d>& inlierPositions1,
                                      vector<Point2d>& inlierPositions2,
-                                    const vector<DMatch>& matches,Mat& F)
+                                    vector<DMatch>& matches,Mat& F)
 {
     vector<unsigned char> status;
     // construct aligned position arrays
@@ -36,10 +36,8 @@ static void computeFundamentalMatrix(const vector<KeyPoint> positions1,const vec
         inputs2.push_back(positions2[matches[i].trainIdx].pt);
         matches1.push_back(matches[i]);
     }
-    
     // fundamental matrix estimation using eight point algorithm with RANSAC
     F = findFundamentalMat(inputs1, inputs2, CV_FM_RANSAC,0.1,0.99, status);
-
     // construct aligned inlier position arrays
     inlierPositions1.clear();
     inlierPositions2.clear();
@@ -51,7 +49,6 @@ static void computeFundamentalMatrix(const vector<KeyPoint> positions1,const vec
             matches2.push_back(matches1[i]);
         }
     }
-
     // use the inliers and compute F again
     vector<Point2d> newInputs1;
     vector<Point2d> newInputs2;
@@ -229,7 +226,6 @@ submap initialise(Mat src , Mat dst){
             frame2.pose=Rt;
         }
     }
-    sub.landmarks.push_back(result);
     vector< vector<double> > vdescriptors;
     vdescriptors.resize(points.size());
     vector< vector<double> > vdescriptors1;
@@ -240,15 +236,15 @@ submap initialise(Mat src , Mat dst){
         int srci,dsti;
         srci=matches[points[i]].queryIdx;
         dsti=matches[points[i]].trainIdx;
-        for(unsigned long j=0;j<descriptors1.cols;j++){
-            vdescriptors1[i].push_back(descriptors1[srci][j]);
+        for(unsigned long j=0;j<descriptor1.cols;j++){
+            vdescriptors[i].push_back(descriptor1[srci][j]);
         }
-        for(unsigned long j=0;j<descriptors2.cols;j++){
-            vdescriptors1[i].push_back(descriptors2[dsti][j]);
+        for(unsigned long j=0;j<descriptor2.cols;j++){
+            vdescriptors1[i].push_back(descriptor2[dsti][j]);
         }
     }
-    cv::Mat acdescriptors1(points.size(), points[0].size(), CV_64FC1);
-    cv::Mat acdescriptors2(points.size(), points[0].size(), CV_64FC1);
+    cv::Mat acdescriptors1(vdescriptors.size(), vdescriptors[0].size(), CV_64FC1);
+    cv::Mat acdescriptors2(vdescriptors1.size(), vdescriptors1[0].size(), CV_64FC1);
     for(int i=0;i<vdescriptors.size();i++){
         for (int j = 0; j < vdescriptors[i].size(); ++j)
         {
@@ -265,13 +261,14 @@ submap initialise(Mat src , Mat dst){
     frame2.descriptors=acdescriptors2;
     sub.frames.push_back(frame1);
     sub.frames.push_back(frame2);
+    sub.landmarks[frame2.descriptors]=result;
     return sub;
 }
-void addtoMap(Mat Curframe,submap sub){
-    vector<Point3d> map3d;
-    map3d = sub.landmarks[sub.landmarks.size()-1];
-    keyframes prevframe;
+bool addtoMap(Mat Curframe,submap sub){
+    keyframes prevframe,curframe;
     prevframe = sub.frames[sub.frames.size()-1];
+    vector<Point3d> map3d;
+    map3d = sub.landmarks[prevframe.descriptors];
     cv::Rect r( 0, 0, 3, 3);
     cv::Mat A = sub.frames.pose;
     cv::Mat Rvec = A(r).clone();
@@ -291,16 +288,51 @@ void addtoMap(Mat Curframe,submap sub){
     distCoeffs.at<double>(4) = 1.1430734623697941e+002;
     vector<Point2d> imagePoints;
     cv::projectPoints(map3d, RVec, tVec,K, distCoeffs, imagePoints);
-    Ptr<SIFT> extractor = SIFT::create();
-    vector<KeyPoint> keypoints;
+    vector<Keypoint> keypoints_1,keypoints_2;
+    keypoints_1 = prevframe.keypoints;
+    vector<Point3d> impLandmarks;
+    cv::Rect rect(cv::Point(), Curframe.size());
+    for(unsigned long i=0;i<imagePoints.size();i++){
+        if (rect.contains(imagePoints[i])){
+            keypoints_2.push_back(Keypoint(imagePoints[i],5));
+            impLandmarks.push_back(map3d[i]);
+        }
+    }
+    if(keypoints_2.size()<10)
+        return false;
+    vector<Point3d> vimplandmarks;
     Mat descriptor;
-    extractor->detect(src, keypoints);
     extractor->compute(src, keypoints, descriptor);
     FlannBasedMatcher matcher;
-    std::vector< DMatch > matches;
+    std::vector< DMatch > rawmatches;
     matcher.match( descriptor, prevframe.descriptors, matches);
-
-
+    vector<Point2d> tmp0, tmp1;
+    Mat f;
+    computeFundamentalMatrix(keypoints_2, keypoints_1, rawMatches, tmp0, tmp1, f);
+    for (int i=0; i<rawMatches.size(); i++) {
+        vimplandmarks.push_back(impLandmarks[rawMatches[i].queryIdx]);
+        curframe.keypoints.push_back(keypoints_2[rawMatches[i].queryIdx]);
+        int srci,dsti;
+        srci=rawMatches[i].queryIdx;
+        for(unsigned long j=0;j<descriptors1.cols;j++){
+            vdescriptors[i].push_back(descriptors1[srci][j]);
+        }
+    }
+    cv::Mat acdescriptors1(vdescriptors.size(), vdescriptors[0].size(), CV_64FC1);
+    for(int i=0;i<vdescriptors.size();i++){
+        for (int j = 0; j < vdescriptors[i].size(); ++j)
+        {
+            acdescriptors1.at<double>(i,j)=vdescriptors[i][j];
+        }
+    }
+    Mat rvec, tvec, R, Rt;
+    solvePnPRansac(vimplandmarks, tmp0, K, distCoeff, rvec, tvec);
+    Rodrigues(rvec, R); constructRt(R, tvec, Rt);
+    curframe.pose=Rt;
+    curframe.descriptor=acdescriptors1;
+    curframe.image=Curframe;
+    sub.frames.push_back(curframe);
+    return true;
 }
 int main(){
     VideoCapture cap(0);
@@ -331,11 +363,8 @@ int main(){
         }
         else{
             submap sub = submaps[submaps.size()-1];
-            if(!addtoMap(src,sub))
-                createKeyframe(src,sub);
-
+            if(!addtoMap(src,sub));
         }
-
     }
     return 0;
 }
